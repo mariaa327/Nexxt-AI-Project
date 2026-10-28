@@ -1,20 +1,20 @@
-"""SQLAlchemy engine, session factory and FastAPI session dependency.
+"""Database routing: one directory database for logins, one database per client.
 
-The database is Supabase-hosted PostgreSQL. There is intentionally no SQLite
-fallback: if ``DATABASE_URL`` is not configured, the application still starts
-(so ``/api/health`` and the docs work) but every database-backed endpoint
-returns a clear configuration error.
+Every client's accounts and transactions live in their own PostgreSQL database
+(``client_<username>``); the directory database only maps usernames to those
+databases. URLs are derived from ``DATABASE_ADMIN_URL`` by swapping the
+database name. Tests replace the router with one that hands out SQLite engines.
 """
 
 from __future__ import annotations
 
-from collections.abc import Generator
-from typing import Any
+import re
+from collections.abc import Callable, Generator
+from threading import Lock
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from fastapi import HTTPException, status
 from sqlalchemy import create_engine
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.core.config import settings
@@ -43,16 +43,15 @@ _SUPPORTED_QUERY_PARAMS = {
 _DROPPED_QUERY_PARAMS = {"pgbouncer", "supa", "schema", "prepare_threshold"}
 
 
-class DatabaseNotConfiguredError(RuntimeError):
-    """Raised when a database operation is attempted without ``DATABASE_URL``."""
+_DATABASE_NAME = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 
 
-class Base(DeclarativeBase):
-    """Declarative base shared by every ORM model."""
+class DirectoryBase(DeclarativeBase):
+    """Tables of the directory database (logins)."""
 
 
-_engine: Engine | None = None
-_session_factory: sessionmaker[Session] | None = None
+class ClientBase(DeclarativeBase):
+    """Tables of each client's own database."""
 
 
 def normalize_database_url(url: str) -> str:
@@ -81,85 +80,100 @@ def normalize_database_url(url: str) -> str:
     return urlunsplit(parts._replace(query=urlencode(kept)))
 
 
-def get_engine() -> Engine:
-    """Return the process-wide engine, creating it on first use.
+def database_url(admin_url: str, database: str) -> str:
+    """The admin URL pointing at another database on the same server."""
+    if not _DATABASE_NAME.match(database):
+        raise ValueError(f"Invalid database name: {database!r}")
+    url = make_url(normalize_database_url(admin_url)).set(database=database)
+    return url.render_as_string(hide_password=False)
 
-    ``create_engine`` is lazy: it does not open a connection until a session is
-    actually used, so importing the app never touches the network.
-    """
-    global _engine
-    if _engine is None:
-        if not settings.database_url:
-            raise DatabaseNotConfiguredError(
-                "DATABASE_URL is not configured. Set it in backend/.env to the "
-                "Supabase PostgreSQL connection string."
+
+class DatabaseRouter:
+    """Creates and caches one engine per database."""
+
+    def __init__(
+        self,
+        admin_url: str | None = None,
+        engine_factory: Callable[[str], Engine] | None = None,
+        create_databases: bool = True,
+    ) -> None:
+        self._admin_url = admin_url or settings.database_admin_url
+        self._engine_factory = engine_factory or (
+            lambda url: create_engine(
+                url, pool_pre_ping=True, pool_size=2, max_overflow=3
             )
-        try:
-            _engine = create_engine(
-                normalize_database_url(settings.database_url),
-                pool_pre_ping=True,
-                future=True,
-            )
-        except Exception as exc:
-            raise DatabaseNotConfiguredError(
-                "DATABASE_URL is not a valid PostgreSQL connection string."
-            ) from exc
-    return _engine
-
-
-def get_session_factory() -> sessionmaker[Session]:
-    """Return the session factory bound to the lazily created engine."""
-    global _session_factory
-    if _session_factory is None:
-        _session_factory = sessionmaker(
-            bind=get_engine(),
-            autoflush=False,
-            autocommit=False,
-            expire_on_commit=False,
         )
-    return _session_factory
+        # False when the factory makes self-contained databases (SQLite in tests).
+        self._create_databases = create_databases
+        self._engines: dict[str, Engine] = {}
+        self._factories: dict[str, sessionmaker[Session]] = {}
+        self._lock = Lock()
+
+    def admin_engine(self) -> Engine:
+        """Server-level connection, autocommit so CREATE DATABASE works."""
+        return self.engine("__admin__")
+
+    def engine(self, database: str) -> Engine:
+        with self._lock:
+            if database not in self._engines:
+                if database == "__admin__":
+                    engine = create_engine(
+                        normalize_database_url(self._admin_url),
+                        isolation_level="AUTOCOMMIT",
+                        pool_pre_ping=True,
+                    )
+                else:
+                    engine = self._engine_factory(
+                        database_url(self._admin_url, database)
+                    )
+                self._engines[database] = engine
+            return self._engines[database]
+
+    def ensure_database(self, database: str) -> bool:
+        """Create the database on the server if missing. True if it was created."""
+        if not self._create_databases:
+            return False
+        database_url(self._admin_url, database)  # validates the name
+        with self.admin_engine().connect() as conn:
+            exists = conn.exec_driver_sql(
+                "SELECT 1 FROM pg_database WHERE datname = %(name)s", {"name": database}
+            ).scalar()
+            if exists:
+                return False
+            # Name validated above; identifiers cannot be bound as parameters.
+            conn.exec_driver_sql(f'CREATE DATABASE "{database}"')
+            return True
+
+    def session(self, database: str) -> Session:
+        engine = self.engine(database)
+        with self._lock:
+            if database not in self._factories:
+                self._factories[database] = sessionmaker(
+                    bind=engine, autoflush=False, expire_on_commit=False
+                )
+            return self._factories[database]()
+
+    def directory_session(self) -> Session:
+        return self.session(settings.directory_database)
+
+    def dispose(self) -> None:
+        with self._lock:
+            for engine in self._engines.values():
+                engine.dispose()
+            self._engines.clear()
+            self._factories.clear()
 
 
-def get_db() -> Generator[Session, Any, None]:
-    """FastAPI dependency that yields a session and always closes it.
+router = DatabaseRouter()
 
-    A missing or invalid ``DATABASE_URL`` becomes a 503 with a configuration
-    hint rather than an unhandled 500, so a copied ``.env.example`` produces an
-    understandable error instead of a stack trace.
-    """
-    try:
-        session = get_session_factory()()
-    except DatabaseNotConfiguredError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=str(exc),
-        ) from exc
+
+def get_router() -> DatabaseRouter:
+    """FastAPI dependency; tests override it."""
+    return router
+
+
+def session_scope(session: Session) -> Generator[Session, None, None]:
     try:
         yield session
     finally:
         session.close()
-
-
-def maybe_get_db() -> Generator[Session | None, Any, None]:
-    """Like ``get_db``, but yields ``None`` when the database is not configured.
-
-    For endpoints where persistence is optional and must not block the response.
-    """
-    try:
-        session = get_session_factory()()
-    except DatabaseNotConfiguredError:
-        yield None
-        return
-    try:
-        yield session
-    finally:
-        session.close()
-
-
-def reset_engine() -> None:
-    """Dispose and forget the cached engine (used by tests)."""
-    global _engine, _session_factory
-    if _engine is not None:
-        _engine.dispose()
-    _engine = None
-    _session_factory = None

@@ -118,3 +118,30 @@ export type ExecuteResponse = {
   balances_after: AccountBalance[];
   decision_after: BillDecision;
 };
+
+export type ChallengeStatus = "pending" | "approved" | "expired" | "cancelled" | "used";
+
+/** Simulated payment verification awaiting approval in the banking app. */
+export type Challenge = {
+  challenge_id: string;
+  option_id: OptionId;
+  merchant_name: string;
+  amount: number;
+  source_label: string;
+  masked_account: string | null;
+  status: ChallengeStatus;
+  approve_after_seconds: number;
+  expires_in_seconds: number;
+};
+
+export type UserInfo = {
+  username: string;
+  display_name: string;
+};
+
+export type DemoUser = UserInfo & { caption: string };
+
+export type LoginResponse = {
+  token: string;
+  user: UserInfo;
+};

@@ -9,13 +9,21 @@ from pathlib import Path
 import pytest
 
 from app.schemas.banking import ClientSnapshot, SavingsAccount, ScheduledPayment
+from app.schemas.insights import ExecuteResponse
 from app.services.banking.categorizer import MCC_CATEGORIES, categorize
 from app.services.banking.engine import build_decision
-from app.services.banking.executor import DemoState
+from app.services.banking.executor import ChallengeStore, apply_option
 from app.services.banking.loader import load_snapshot
 from app.services.banking.recurring import detect_recurring, next_monthly_date
 from app.services.banking.rules import rules_recommendation
-from app.services.errors import BankingDataError, OptionNotAvailableError
+from app.services.errors import (
+    BankingDataError,
+    ChallengeExpiredError,
+    ChallengeNotApprovedError,
+    ChallengeNotFoundError,
+    OptionNotAvailableError,
+)
+from tests.conftest import FakeClock
 
 
 def _costs(snapshot: ClientSnapshot) -> dict[str, Decimal]:
@@ -216,22 +224,33 @@ def test_missing_fixture_raises(tmp_path: Path) -> None:
         load_snapshot(tmp_path / "absent.json")
 
 
-# --- Execution --------------------------------------------------------------
+# --- Verification and execution --------------------------------------------
+
+OWNER = "andrei"
 
 
-def _state(snapshot: ClientSnapshot) -> DemoState:
-    return DemoState(loader=lambda: snapshot.model_copy(deep=True))
+def _approve_and_apply(
+    snapshot: ClientSnapshot, store: ChallengeStore, clock: FakeClock, option_id: str
+) -> ExecuteResponse:
+    challenge_id = store.initiate(OWNER, snapshot, option_id).challenge_id
+    clock.advance(3)
+    challenge = store.consume(OWNER, challenge_id)
+    return apply_option(snapshot, challenge.option_id)[1]
 
 
-def test_execute_credit_card_clears_deficit(snapshot: ClientSnapshot) -> None:
-    result = _state(snapshot).execute("credit_card")
+def test_execute_credit_card_clears_deficit(
+    snapshot: ClientSnapshot, store: ChallengeStore, clock: FakeClock
+) -> None:
+    result = _approve_and_apply(snapshot, store, clock, "credit_card")
     assert result.decision_after.no_action_needed
     card = next(b for b in result.balances_after if b.account_type == "CREDIT_CARD")
     assert card.balance == Decimal("7531.60")
 
 
-def test_execute_savings_clears_deficit(snapshot: ClientSnapshot) -> None:
-    result = _state(snapshot).execute("savings")
+def test_execute_savings_clears_deficit(
+    snapshot: ClientSnapshot, store: ChallengeStore, clock: FakeClock
+) -> None:
+    result = _approve_and_apply(snapshot, store, clock, "savings")
     assert result.decision_after.no_action_needed
     after = {b.account_type: b for b in result.balances_after}
     assert after["CURRENT_ACCOUNT"].balance == Decimal("768.40")
@@ -239,15 +258,104 @@ def test_execute_savings_clears_deficit(snapshot: ClientSnapshot) -> None:
     assert after["SAVINGS_ACCOUNT"].accrued_interest == Decimal(0)
 
 
-def test_execute_unavailable_option_raises(snapshot: ClientSnapshot) -> None:
-    state = _state(snapshot)
-    state.execute("credit_card")
+def test_apply_option_leaves_input_untouched(snapshot: ClientSnapshot) -> None:
+    before = snapshot.model_dump()
+    apply_option(snapshot, "credit_card")
+    assert snapshot.model_dump() == before
+
+
+def test_challenge_describes_the_payment(
+    snapshot: ClientSnapshot, store: ChallengeStore
+) -> None:
+    challenge = store.initiate(OWNER, snapshot, "credit_card")
+    assert challenge.status == "pending"
+    assert challenge.merchant_name == "Enel Energie"
+    assert challenge.amount == Decimal("618.40")
+    assert challenge.source_label == "Credit card"
+    assert challenge.masked_account == "•••• 0000"
+
+
+def test_challenge_approves_after_delay(
+    snapshot: ClientSnapshot, store: ChallengeStore, clock: FakeClock
+) -> None:
+    challenge_id = store.initiate(OWNER, snapshot, "credit_card").challenge_id
+    clock.advance(2.9)
+    assert store.challenge(OWNER, challenge_id).status == "pending"
+    clock.advance(0.1)
+    assert store.challenge(OWNER, challenge_id).status == "approved"
+
+
+def test_consume_before_approval_is_refused(
+    snapshot: ClientSnapshot, store: ChallengeStore
+) -> None:
+    challenge_id = store.initiate(OWNER, snapshot, "credit_card").challenge_id
+    with pytest.raises(ChallengeNotApprovedError):
+        store.consume(OWNER, challenge_id)
+
+
+def test_challenge_works_once(
+    snapshot: ClientSnapshot, store: ChallengeStore, clock: FakeClock
+) -> None:
+    challenge_id = store.initiate(OWNER, snapshot, "credit_card").challenge_id
+    clock.advance(3)
+    store.consume(OWNER, challenge_id)
+    assert store.challenge(OWNER, challenge_id).status == "used"
+    with pytest.raises(ChallengeNotApprovedError):
+        store.consume(OWNER, challenge_id)
+
+
+def test_cancelled_challenge_cannot_execute(
+    snapshot: ClientSnapshot, store: ChallengeStore, clock: FakeClock
+) -> None:
+    challenge_id = store.initiate(OWNER, snapshot, "credit_card").challenge_id
+    assert store.cancel(OWNER, challenge_id).status == "cancelled"
+    clock.advance(3)
+    with pytest.raises(ChallengeNotApprovedError):
+        store.consume(OWNER, challenge_id)
+
+
+def test_expired_challenge_cannot_execute(
+    snapshot: ClientSnapshot, store: ChallengeStore, clock: FakeClock
+) -> None:
+    challenge_id = store.initiate(OWNER, snapshot, "credit_card").challenge_id
+    clock.advance(121)
+    assert store.challenge(OWNER, challenge_id).status == "expired"
+    with pytest.raises(ChallengeExpiredError):
+        store.consume(OWNER, challenge_id)
+
+
+def test_challenge_belongs_to_its_owner(
+    snapshot: ClientSnapshot, store: ChallengeStore, clock: FakeClock
+) -> None:
+    challenge_id = store.initiate(OWNER, snapshot, "credit_card").challenge_id
+    clock.advance(3)
+    with pytest.raises(ChallengeNotFoundError):
+        store.challenge("maria", challenge_id)
+    with pytest.raises(ChallengeNotFoundError):
+        store.consume("maria", challenge_id)
+
+
+def test_unknown_challenge_raises(store: ChallengeStore) -> None:
+    with pytest.raises(ChallengeNotFoundError):
+        store.consume(OWNER, "missing")
+
+
+def test_initiate_unavailable_option_raises(
+    snapshot: ClientSnapshot, store: ChallengeStore
+) -> None:
     with pytest.raises(OptionNotAvailableError):
-        state.execute("savings")
+        store.initiate(OWNER, snapshot, "overdraft")
+    paid, _ = apply_option(snapshot, "credit_card")
+    with pytest.raises(OptionNotAvailableError):
+        store.initiate(OWNER, paid, "savings")
 
 
-def test_reset_restores_original(snapshot: ClientSnapshot) -> None:
-    state = _state(snapshot)
-    state.execute("credit_card")
-    state.reset()
-    assert not build_decision(state.snapshot()).no_action_needed
+def test_clear_drops_only_that_users_challenges(
+    snapshot: ClientSnapshot, store: ChallengeStore
+) -> None:
+    mine = store.initiate(OWNER, snapshot, "credit_card").challenge_id
+    theirs = store.initiate("maria", snapshot, "credit_card").challenge_id
+    store.clear(OWNER)
+    with pytest.raises(ChallengeNotFoundError):
+        store.challenge(OWNER, mine)
+    assert store.challenge("maria", theirs).status == "pending"

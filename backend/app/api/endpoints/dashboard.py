@@ -1,15 +1,13 @@
-"""Dashboard endpoint: the deterministic picture, no AI call."""
+"""Dashboard endpoint: the deterministic picture for the logged-in user, no AI call."""
 
 from __future__ import annotations
 
-from typing import Annotated
+from fastapi import APIRouter
 
-from fastapi import APIRouter, Depends
-
-from app.api.deps import get_demo_state
+from app.api.deps import ClientSession
 from app.schemas.insights import BillDecision
+from app.services import client_repository
 from app.services.banking.engine import build_decision
-from app.services.banking.executor import DemoState
 
 router = APIRouter(tags=["dashboard"])
 
@@ -18,6 +16,7 @@ router = APIRouter(tags=["dashboard"])
     "/dashboard",
     response_model=BillDecision,
     summary="Balances, upcoming payments, projection and priced options",
+    responses={401: {"description": "Not logged in"}},
 )
-def get_dashboard(state: Annotated[DemoState, Depends(get_demo_state)]) -> BillDecision:
-    return build_decision(state.snapshot())
+def get_dashboard(session: ClientSession) -> BillDecision:
+    return build_decision(client_repository.load_snapshot(session))

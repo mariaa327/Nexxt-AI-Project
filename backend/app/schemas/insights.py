@@ -149,8 +149,29 @@ class AnalyzeResponse(BaseModel):
     persisted: bool = False
 
 
-class ExecuteRequest(BaseModel):
+class InitiateRequest(BaseModel):
     option_id: OptionId
+
+
+ChallengeStatus = Literal["pending", "approved", "expired", "cancelled", "used"]
+
+
+class Challenge(BaseModel):
+    """A simulated payment verification awaiting approval in the banking app."""
+
+    challenge_id: str
+    option_id: OptionId
+    merchant_name: str
+    amount: Money
+    source_label: str
+    masked_account: str | None
+    status: ChallengeStatus
+    approve_after_seconds: float
+    expires_in_seconds: float
+
+
+class ExecuteRequest(BaseModel):
+    challenge_id: str = Field(..., min_length=1, max_length=64)
 
 
 class ExecuteResponse(BaseModel):

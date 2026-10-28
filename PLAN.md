@@ -26,7 +26,7 @@ In scope:
    and phrases it as bullet points. It does no arithmetic.
 3. **Dashboard UI** — balances, upcoming bills, projected-balance chart, recommendation, one-click
    apply, and a dropdown explaining how the engine computed the numbers.
-4. **No authentication** — Supabase Auth is removed; the app serves one demo client.
+4. **Fictional clients** — each logs in and has their own PostgreSQL database (see D17, D18).
 
 Out of scope:
 
@@ -37,24 +37,29 @@ Out of scope:
 ## Architecture
 
 ```
-browser ──► Next.js dashboard (/)
-              │  GET  /api/dashboard        deterministic, no LLM
-              │  POST /api/agent/analyze    engine → LLM (or rules fallback)
-              │  POST /api/agent/execute    apply option in memory
+browser ──► Next.js /login → dashboard (/)
+              │  POST /api/auth/login                directory DB → signed token
+              │  GET  /api/dashboard                 user's DB → engine, no LLM
+              │  POST /api/agent/analyze             engine → LLM (or rules fallback)
+              │  POST /api/agent/execute/initiate    start an app-approval challenge
+              │  GET  /api/agent/challenges/{id}     poll approval status
+              │  POST /api/agent/execute             apply once approved, saved to user's DB
+              │  POST /api/agent/reset               re-seed the user's DB
               ▼
 FastAPI ──► services/banking/
               loader → categorizer → recurring → projection → options → engine
             services/ai_agent.py   BillDecision → AgentRecommendation
-            services/persistence.py  best-effort row in agent_tasks
+            services/client_repository.py  user DB <-> ClientSnapshot, analyses
+PostgreSQL ─► bank_directory (logins) + client_andrei, client_maria, … (one per user)
 ```
 
 The LLM sees only `BillDecision`. If its answer names an option the engine did not recommend, or
-no API key is configured, a deterministic rules message is returned instead
+no AWS credentials are configured, a deterministic rules message is returned instead
 (`generated_by: "rules"`).
 
 ## Demo scenario
 
-Data: `backend/app/data/client1_date.json` (the original October history, plus a savings
+Data: `backend/app/data/users/andrei.json` (the original October history, plus a savings
 account, product parameters and scheduled November payments). Today is `2026-10-28`.
 
 | Account | Balance |
@@ -90,4 +95,4 @@ See `PROGRESS.md` for the live checklist.
 - `cd frontend && npm run lint && npm run typecheck && npm run build`.
 - `docker compose config`; `docker compose up --build` when Docker is available.
 - Without `OPENAI_API_KEY`: dashboard works, `analyze` returns `generated_by: "rules"`.
-- Without `DATABASE_URL`: `analyze` returns `persisted: false` and nothing fails.
+- Log in as each demo user (`overdraft2026`); each sees their own edge case.

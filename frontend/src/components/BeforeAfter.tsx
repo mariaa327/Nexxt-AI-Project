@@ -1,13 +1,21 @@
-import { ArrowRight } from "lucide-react";
+import { ArrowRight, CheckCircle2 } from "lucide-react";
 
 import { formatRon, formatSignedRon } from "@/lib/format";
 import type { ExecuteResponse } from "@/lib/types";
 
 export function BeforeAfter({ result }: { result: ExecuteResponse }) {
   return (
-    <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-4 text-sm">
-      <p className="font-medium">{result.message}</p>
-      <table className="mt-3 w-full text-left tabular-nums">
+    <div
+      role="status"
+      className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-4 text-sm"
+    >
+      <p className="flex items-center gap-2 font-semibold text-emerald-700 dark:text-emerald-400">
+        <CheckCircle2 aria-hidden="true" className="h-4 w-4" />
+        Payment successful
+      </p>
+      <p className="mt-1">{result.message}</p>
+      <div className="overflow-x-auto">
+      <table className="mt-3 w-full min-w-[22rem] text-left tabular-nums">
         <thead className="text-xs text-[var(--muted)]">
           <tr>
             <th className="py-1 font-medium">Account</th>
@@ -39,6 +47,7 @@ export function BeforeAfter({ result }: { result: ExecuteResponse }) {
           })}
         </tbody>
       </table>
+      </div>
     </div>
   );
 }

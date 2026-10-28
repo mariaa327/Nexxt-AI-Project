@@ -2,27 +2,29 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+from typing import Annotated
+
+from fastapi import APIRouter, Depends
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.config import settings
-from app.services.banking.loader import load_snapshot
-from app.services.errors import BankingDataError
+from app.core.database import DatabaseRouter, get_router
 
 router = APIRouter(tags=["health"])
 
 
 @router.get("/health", summary="Liveness and configuration summary")
-def health() -> dict[str, object]:
-    """Report that the API is running.
-
-    Deliberately does not contact the database or the AI provider: this
-    endpoint must work with no credentials configured.
-    """
+def health(
+    db_router: Annotated[DatabaseRouter, Depends(get_router)],
+) -> dict[str, object]:
+    """Report that the API is running. Never calls the AI provider, never fails."""
     try:
-        load_snapshot()
-        demo_data_loaded = True
-    except BankingDataError:
-        demo_data_loaded = False
+        with db_router.directory_session() as session:
+            session.execute(text("SELECT 1"))
+        database_reachable = True
+    except (SQLAlchemyError, OSError):
+        database_reachable = False
 
     return {
         "status": "ok",
@@ -30,8 +32,7 @@ def health() -> dict[str, object]:
         "environment": settings.app_env,
         # Booleans only — never expose the values themselves.
         "integrations": {
-            "database_configured": bool(settings.database_url),
-            "ai_configured": bool(settings.openai_api_key),
-            "demo_data_loaded": demo_data_loaded,
+            "database_reachable": database_reachable,
+            "ai_configured": bool(settings.aws_access_key_id),
         },
     }

@@ -95,7 +95,7 @@ export function RecommendationCard({
               {applying ? (
                 <>
                   <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />
-                  Applying…
+                  Verifying…
                 </>
               ) : (
                 <>

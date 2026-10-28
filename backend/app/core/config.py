@@ -33,35 +33,52 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    # --- Database (Supabase PostgreSQL) -------------------------------------
-    # Optional: analyses are persisted when set, and skipped when not.
-    database_url: str | None = None
+    # --- Databases (PostgreSQL) -----------------------------------------------
+    # Server connection with rights to create databases. The directory database
+    # and one database per client are derived from it by swapping the name.
+    database_admin_url: str = "postgresql://bank:bank@localhost:5432/postgres"
+    directory_database: str = "bank_directory"
+    # Create and seed missing databases on startup (development convenience).
+    provision_on_startup: bool = True
 
-    # --- AI provider --------------------------------------------------------
-    openai_api_key: str | None = None
-    openai_model: str = "gpt-4.1-mini"
+    # --- Sessions ---------------------------------------------------------------
+    # Signs login tokens. When unset a random secret is generated per process,
+    # so restarting the backend logs everyone out.
+    session_secret: str | None = None
+    session_hours: float = 8.0
 
-    # --- Demo client data ---------------------------------------------------
-    # Defaults to app/data/client1_date.json, which ships in the Docker image.
-    demo_data_path: Path | None = None
+    # --- AI provider: Amazon Bedrock -----------------------------------------
+    # Standard AWS variable names. Left empty, boto3 falls back to its default
+    # credential chain (instance role, ~/.aws, ...).
+    aws_default_region: str = "us-west-2"
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: str | None = None
+    aws_session_token: str | None = None
+    bedrock_model_id: str = "us.anthropic.claude-sonnet-5-5"
+    # A slow provider falls back to rules wording instead of blocking the page.
+    ai_timeout_seconds: float = 20.0
+
+    # --- Demo ------------------------------------------------------------------
     # Overrides the data file's ``as_of_date`` ("today" for the projection).
     demo_today: date | None = None
+    # Simulated "approve in your banking app" delay for payment verification.
+    demo_approval_seconds: float = 3.0
 
     # --- Application --------------------------------------------------------
     # NoDecode keeps pydantic-settings from treating the JSON array as a
     # "complex" field that must be JSON-encoded again; the validator below
     # accepts either a JSON list or a comma separated string.
     cors_origins: Annotated[list[str], NoDecode] = ["http://localhost:3000"]
-    auto_create_tables: bool = True
     app_env: str = "development"
     log_level: str = "INFO"
 
     # Validators -------------------------------------------------------------
 
     @field_validator(
-        "database_url",
-        "openai_api_key",
-        "demo_data_path",
+        "session_secret",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "aws_session_token",
         "demo_today",
         mode="before",
     )

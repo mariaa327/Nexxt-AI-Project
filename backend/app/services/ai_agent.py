@@ -1,10 +1,10 @@
-"""AI agent service built on the native OpenAI Python SDK.
+"""AI agent service on Amazon Bedrock (Anthropic Claude, Converse API).
 
 The model only phrases a decision the banking engine has already computed. It
-receives the ``BillDecision`` JSON (never raw transactions), returns a
-``RecommendationDraft``, and the draft is checked against the decision before
-use. Any failure falls back to the deterministic rules text, so the dashboard
-never depends on the provider being up.
+receives the ``BillDecision`` JSON (never raw transactions) and must answer by
+calling one tool whose input schema is ``RecommendationDraft``; the draft is
+then checked against the decision before use. Any failure falls back to the
+deterministic rules text, so the dashboard never depends on the provider.
 """
 
 from __future__ import annotations
@@ -15,14 +15,10 @@ import re
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from openai import (
-    APIConnectionError,
-    APIError,
-    APITimeoutError,
-    AuthenticationError,
-    OpenAI,
-    RateLimitError,
-)
+import boto3
+from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
+from pydantic import ValidationError
 
 from app.core.config import settings
 from app.schemas.banking import round_money
@@ -38,10 +34,13 @@ from app.services.errors import (
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """\
+TOOL_NAME = "submit_recommendation"
+
+SYSTEM_PROMPT = f"""\
 You are the assistant of a bank. A deterministic engine has already analysed the
 client's accounts and decided how to avoid an overdraft. You receive that
-decision as JSON. Your only job is to explain it to the client in plain English.
+decision as JSON. Your only job is to explain it to the client in plain English,
+by calling the {TOOL_NAME} tool exactly once.
 
 Rules:
 - Use only numbers that appear in the JSON. Never calculate, estimate or round
@@ -55,37 +54,75 @@ Rules:
 - reasons: 3 to 5 short bullets. Each states one decision and why: when and why
   the account goes negative, what doing nothing would cost, why the recommended
   option is cheaper, and what it protects (for example accrued savings interest).
+  Point out where the client's money actually is (savings balance, available
+  credit on the card): the problem is money in the wrong account, not a lack of
+  money.
 - Do not comment on past spending habits and do not give budgeting advice for
   the future. Do not add disclaimers. Address the client as "you".
 """
 
+# Credentials missing, wrong or expired: a configuration problem, not an outage.
+_CREDENTIAL_ERRORS = frozenset(
+    {
+        "AccessDeniedException",
+        "ExpiredTokenException",
+        "UnrecognizedClientException",
+        "InvalidSignatureException",
+    }
+)
+
 _AMOUNT = re.compile(r"\d[\d,]*\.\d+")
+
+
+def _tool_config() -> dict[str, Any]:
+    return {
+        "tools": [
+            {
+                "toolSpec": {
+                    "name": TOOL_NAME,
+                    "description": "Submit the client-facing recommendation.",
+                    "inputSchema": {"json": RecommendationDraft.model_json_schema()},
+                }
+            }
+        ],
+        # Newer Claude models on Bedrock reject a forced tool choice; the system
+        # prompt requires the call, and a reply without it falls back to rules.
+        "toolChoice": {"auto": {}},
+    }
 
 
 class AIAgentService:
     """Turns a ``BillDecision`` into a client-facing recommendation."""
 
-    def __init__(
-        self,
-        api_key: str | None = None,
-        model: str | None = None,
-        client: OpenAI | None = None,
-    ) -> None:
-        self._api_key = api_key if api_key is not None else settings.openai_api_key
-        self._model = model or settings.openai_model
-        # The client is created lazily so importing the app (or running the
-        # health check) works without a key.
+    def __init__(self, client: Any | None = None, model: str | None = None) -> None:
+        self._model = model or settings.bedrock_model_id
+        # Created lazily so importing the app and the health check need no AWS.
         self._client = client
 
     @property
     def model(self) -> str:
         return self._model
 
-    def _get_client(self) -> OpenAI:
+    @staticmethod
+    def configured() -> bool:
+        return bool(settings.aws_access_key_id and settings.aws_secret_access_key)
+
+    def _get_client(self) -> Any:
         if self._client is None:
-            if not self._api_key:
+            if not self.configured():
                 raise AgentConfigurationError()
-            self._client = OpenAI(api_key=self._api_key)
+            self._client = boto3.client(
+                "bedrock-runtime",
+                region_name=settings.aws_default_region,
+                aws_access_key_id=settings.aws_access_key_id,
+                aws_secret_access_key=settings.aws_secret_access_key,
+                aws_session_token=settings.aws_session_token,
+                config=Config(
+                    connect_timeout=5,
+                    read_timeout=settings.ai_timeout_seconds,
+                    retries={"max_attempts": 2, "mode": "standard"},
+                ),
+            )
         return self._client
 
     @staticmethod
@@ -93,44 +130,61 @@ class AIAgentService:
         return "Pre-computed decision (JSON):\n" + decision.model_dump_json(indent=2)
 
     def draft(self, decision: BillDecision) -> RecommendationDraft:
-        """Call the model with structured output. Raises ``AgentServiceError``."""
+        """Call the model with a forced tool call. Raises ``AgentServiceError``."""
         client = self._get_client()
         try:
-            response = client.responses.parse(
-                model=self._model,
-                instructions=SYSTEM_PROMPT,
-                input=self.build_input(decision),
-                text_format=RecommendationDraft,
+            response = client.converse(
+                modelId=self._model,
+                system=[{"text": SYSTEM_PROMPT}],
+                messages=[
+                    {"role": "user", "content": [{"text": self.build_input(decision)}]}
+                ],
+                toolConfig=_tool_config(),
+                inferenceConfig={"maxTokens": 1500},
             )
-        except AuthenticationError as exc:
-            # Log the failure type only; never the key or the request body.
-            logger.error("AI provider rejected the configured credentials")
-            raise AgentConfigurationError("Invalid AI provider credentials.") from exc
-        except RateLimitError as exc:
-            logger.warning("AI provider rate limit reached")
-            raise AgentProviderError("The AI service is rate limited.") from exc
-        except (APITimeoutError, APIConnectionError) as exc:
-            logger.warning("AI provider is unreachable: %s", type(exc).__name__)
-            raise AgentProviderError("The AI service is unreachable.") from exc
-        except APIError as exc:
-            logger.error("AI provider returned an error: %s", type(exc).__name__)
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            # Log the error code only; never credentials or the request body.
+            if code in _CREDENTIAL_ERRORS:
+                logger.error("Bedrock rejected the credentials: %s", code)
+                raise AgentConfigurationError(
+                    "AI credentials are invalid or expired."
+                ) from exc
+            logger.warning("Bedrock returned an error: %s", code)
             raise AgentProviderError() from exc
+        except NoCredentialsError as exc:
+            raise AgentConfigurationError() from exc
+        except BotoCoreError as exc:
+            # Timeouts and connection failures.
+            logger.warning("Bedrock is unreachable: %s", type(exc).__name__)
+            raise AgentProviderError("The AI service is unreachable.") from exc
 
-        if getattr(response, "status", None) == "failed":
-            logger.error("AI provider reported a failed response")
-            raise AgentProviderError()
+        if response.get("stopReason") in ("guardrail_intervened", "content_filtered"):
+            raise AgentRefusalError()
 
-        self._raise_on_refusal(response)
-
-        parsed = response.output_parsed
-        if parsed is None:
-            logger.error("AI provider returned no parsed structured output")
+        content = response.get("output", {}).get("message", {}).get("content", [])
+        tool_input = next(
+            (
+                block["toolUse"].get("input")
+                for block in content
+                if "toolUse" in block and block["toolUse"].get("name") == TOOL_NAME
+            ),
+            None,
+        )
+        if tool_input is None:
+            logger.error("Bedrock returned no tool call")
             raise AgentEmptyResponseError()
-        return parsed
+        try:
+            return RecommendationDraft.model_validate(tool_input)
+        except ValidationError as exc:
+            logger.error(
+                "Bedrock tool input failed validation (%d errors)", exc.error_count()
+            )
+            raise AgentEmptyResponseError() from exc
 
     def recommend(self, decision: BillDecision) -> AgentRecommendation:
         """Model wording when it is available and consistent; rules otherwise."""
-        if self._client is None and not self._api_key:
+        if self._client is None and not self.configured():
             return rules_recommendation(decision, "AI provider not configured")
         try:
             draft = self.draft(decision)
@@ -143,14 +197,6 @@ class AIAgentService:
             logger.warning("Model output rejected: %s", problem)
             return rules_recommendation(decision, f"Model output rejected: {problem}")
         return AgentRecommendation(**draft.model_dump(), generated_by="llm")
-
-    @staticmethod
-    def _raise_on_refusal(response: Any) -> None:
-        """Detect a refusal block anywhere in the response output."""
-        for item in getattr(response, "output", []) or []:
-            for content in getattr(item, "content", []) or []:
-                if getattr(content, "type", None) == "refusal":
-                    raise AgentRefusalError()
 
 
 def _known_amounts(value: Any, found: set[Decimal]) -> set[Decimal]:

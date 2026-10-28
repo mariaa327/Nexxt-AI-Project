@@ -2,37 +2,38 @@
 
 from __future__ import annotations
 
-from collections.abc import Generator
 from typing import Any
 
 import pytest
+from botocore.exceptions import ClientError, ReadTimeoutError
 from fastapi.testclient import TestClient
-from sqlalchemy.orm import Session
+from sqlalchemy import select
 
-from app.api.deps import get_agent_service, get_demo_state
-from app.core.database import maybe_get_db
-from app.main import app
-from app.models.domain import AgentTask
+from app.core.database import DatabaseRouter
+from app.models.client import Analysis
 from app.schemas.banking import ClientSnapshot
 from app.schemas.insights import BillDecision, RecommendationDraft
-from app.services.ai_agent import AIAgentService
+from app.services.ai_agent import TOOL_NAME, AIAgentService
 from app.services.banking.engine import build_decision
-from app.services.banking.executor import DemoState
 from app.services.errors import (
     AgentConfigurationError,
     AgentEmptyResponseError,
     AgentProviderError,
     AgentRefusalError,
 )
+from tests.conftest import FakeClock
+
+H = dict[str, str]
 
 # --- Endpoints --------------------------------------------------------------
 
 
-def test_dashboard_returns_engine_numbers(client: TestClient) -> None:
-    response = client.get("/api/dashboard")
+def test_dashboard_returns_engine_numbers(client: TestClient, andrei: H) -> None:
+    response = client.get("/api/dashboard", headers=andrei)
 
     assert response.status_code == 200
     body = response.json()
+    assert body["customer_name"] == "Andrei Popescu"
     assert body["projection"]["first_deficit_date"] == "2026-11-05"
     assert body["projection"]["peak_deficit"] == 318.4
     assert [(o["option_id"], o["cost"]) for o in body["options"]] == [
@@ -40,12 +41,13 @@ def test_dashboard_returns_engine_numbers(client: TestClient) -> None:
         ("savings", 12.4),
         ("overdraft", 31.19),
     ]
+    assert body["balances"][0]["account_type"] == "CURRENT_ACCOUNT"
 
 
-def test_analyze_without_ai_key_uses_rules_and_persists(
-    client: TestClient, db_session: Session
+def test_analyze_uses_rules_without_ai_and_saves_analysis(
+    client: TestClient, andrei: H, db_router: DatabaseRouter
 ) -> None:
-    response = client.post("/api/agent/analyze")
+    response = client.post("/api/agent/analyze", headers=andrei)
 
     assert response.status_code == 200
     body = response.json()
@@ -53,49 +55,96 @@ def test_analyze_without_ai_key_uses_rules_and_persists(
     assert recommendation["generated_by"] == "rules"
     assert recommendation["fallback_reason"] == "AI provider not configured"
     assert recommendation["recommended_option_id"] == "credit_card"
-    assert recommendation["reasons"]
     assert body["persisted"] is True
 
-    task = db_session.query(AgentTask).one()
-    assert task.customer_id == "CUST-883921"
-    assert str(task.id) == body["task_id"]
+    with db_router.session("client_andrei") as session:
+        stored = session.scalars(select(Analysis)).one()
+    assert str(stored.id) == body["task_id"]
+    with db_router.session("client_maria") as session:
+        assert session.scalars(select(Analysis)).first() is None
 
 
-def test_analyze_without_database_still_succeeds(state: DemoState) -> None:
-    def no_db() -> Generator[None, None, None]:
-        yield None
-
-    app.dependency_overrides[maybe_get_db] = no_db
-    app.dependency_overrides[get_demo_state] = lambda: state
-    app.dependency_overrides[get_agent_service] = lambda: AIAgentService(api_key=None)
-    try:
-        with TestClient(app) as client:
-            response = client.post("/api/agent/analyze")
-    finally:
-        app.dependency_overrides.clear()
-
-    assert response.status_code == 200
-    assert response.json()["persisted"] is False
-    assert response.json()["task_id"] is None
+def _verified_execute(
+    client: TestClient, clock: FakeClock, headers: H, option_id: str
+) -> Any:
+    initiated = client.post(
+        "/api/agent/execute/initiate", json={"option_id": option_id}, headers=headers
+    )
+    assert initiated.status_code == 201, initiated.text
+    challenge_id = initiated.json()["challenge_id"]
+    clock.advance(3)
+    status = client.get(f"/api/agent/challenges/{challenge_id}", headers=headers)
+    assert status.json()["status"] == "approved"
+    return client.post(
+        "/api/agent/execute", json={"challenge_id": challenge_id}, headers=headers
+    )
 
 
-def test_execute_then_analyze_reports_no_risk(client: TestClient) -> None:
-    executed = client.post("/api/agent/execute", json={"option_id": "credit_card"})
+def test_execute_then_analyze_reports_no_risk(
+    client: TestClient, clock: FakeClock, andrei: H
+) -> None:
+    executed = _verified_execute(client, clock, andrei, "credit_card")
     assert executed.status_code == 200
     assert executed.json()["decision_after"]["no_action_needed"] is True
 
-    analyzed = client.post("/api/agent/analyze").json()
+    analyzed = client.post("/api/agent/analyze", headers=andrei).json()
     assert analyzed["recommendation"]["status"] == "no_risk"
 
 
-def test_execute_rejects_unknown_option(client: TestClient) -> None:
-    response = client.post("/api/agent/execute", json={"option_id": "lottery"})
+def test_execute_requires_approval(client: TestClient, andrei: H) -> None:
+    initiated = client.post(
+        "/api/agent/execute/initiate", json={"option_id": "credit_card"}, headers=andrei
+    ).json()
+    response = client.post(
+        "/api/agent/execute",
+        json={"challenge_id": initiated["challenge_id"]},
+        headers=andrei,
+    )
+
+    assert response.status_code == 409
+    assert (
+        client.get("/api/dashboard", headers=andrei).json()["no_action_needed"] is False
+    )
+
+
+def test_cancel_challenge(client: TestClient, clock: FakeClock, andrei: H) -> None:
+    challenge_id = client.post(
+        "/api/agent/execute/initiate", json={"option_id": "credit_card"}, headers=andrei
+    ).json()["challenge_id"]
+    cancelled = client.post(
+        f"/api/agent/challenges/{challenge_id}/cancel", headers=andrei
+    )
+    clock.advance(3)
+
+    assert cancelled.json()["status"] == "cancelled"
+    response = client.post(
+        "/api/agent/execute", json={"challenge_id": challenge_id}, headers=andrei
+    )
+    assert response.status_code == 409
+
+
+def test_unknown_challenge_is_404(client: TestClient, andrei: H) -> None:
+    assert client.get("/api/agent/challenges/nope", headers=andrei).status_code == 404
+    response = client.post(
+        "/api/agent/execute", json={"challenge_id": "nope"}, headers=andrei
+    )
+    assert response.status_code == 404
+
+
+def test_initiate_rejects_unknown_option(client: TestClient, andrei: H) -> None:
+    response = client.post(
+        "/api/agent/execute/initiate", json={"option_id": "lottery"}, headers=andrei
+    )
     assert response.status_code == 422
 
 
-def test_execute_rejects_option_not_offered(client: TestClient) -> None:
-    client.post("/api/agent/execute", json={"option_id": "credit_card"})
-    response = client.post("/api/agent/execute", json={"option_id": "savings"})
+def test_initiate_rejects_option_not_offered(
+    client: TestClient, clock: FakeClock, andrei: H
+) -> None:
+    _verified_execute(client, clock, andrei, "credit_card")
+    response = client.post(
+        "/api/agent/execute/initiate", json={"option_id": "savings"}, headers=andrei
+    )
 
     assert response.status_code == 422
     assert (
@@ -104,9 +153,11 @@ def test_execute_rejects_option_not_offered(client: TestClient) -> None:
     )
 
 
-def test_reset_restores_deficit(client: TestClient) -> None:
-    client.post("/api/agent/execute", json={"option_id": "credit_card"})
-    response = client.post("/api/agent/reset")
+def test_reset_restores_deficit(
+    client: TestClient, clock: FakeClock, andrei: H
+) -> None:
+    _verified_execute(client, clock, andrei, "credit_card")
+    response = client.post("/api/agent/reset", headers=andrei)
 
     assert response.status_code == 200
     assert response.json()["no_action_needed"] is False
@@ -115,46 +166,42 @@ def test_reset_restores_deficit(client: TestClient) -> None:
 # --- Service ----------------------------------------------------------------
 
 
-class _StubResponse:
-    def __init__(
-        self,
-        parsed: RecommendationDraft | None,
-        status: str = "completed",
-        refusal: bool = False,
-    ) -> None:
-        self.output_parsed = parsed
-        self.status = status
-        self.output: list[Any] = []
-        if refusal:
-            self.output = [
-                type(
-                    "Item",
-                    (),
-                    {"content": [type("Content", (), {"type": "refusal"})()]},
-                )()
-            ]
+def _tool_response(
+    draft: dict[str, Any] | None, stop: str = "tool_use"
+) -> dict[str, Any]:
+    """A Bedrock Converse response, optionally carrying the recommendation tool call."""
+    content: list[dict[str, Any]] = [{"text": "Here is the recommendation."}]
+    if draft is not None:
+        content.append(
+            {"toolUse": {"toolUseId": "t1", "name": TOOL_NAME, "input": draft}}
+        )
+    return {
+        "output": {"message": {"role": "assistant", "content": content}},
+        "stopReason": stop,
+    }
 
 
-class _StubResponses:
-    def __init__(self, response: _StubResponse | Exception) -> None:
+class _StubBedrock:
+    def __init__(self, response: dict[str, Any] | Exception) -> None:
         self._response = response
         self.calls: list[dict[str, Any]] = []
 
-    def parse(self, **kwargs: Any) -> _StubResponse:
+    def converse(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(kwargs)
         if isinstance(self._response, Exception):
             raise self._response
         return self._response
 
 
-class _StubClient:
-    def __init__(self, response: _StubResponse | Exception) -> None:
-        self.responses = _StubResponses(response)
+def _service(
+    response: dict[str, Any] | Exception,
+) -> tuple[AIAgentService, _StubBedrock]:
+    stub = _StubBedrock(response)
+    return AIAgentService(client=stub), stub
 
 
-def _service(response: _StubResponse | Exception) -> tuple[AIAgentService, _StubClient]:
-    stub = _StubClient(response)
-    return AIAgentService(api_key="test-key", client=stub), stub  # type: ignore[arg-type]
+def _client_error(code: str) -> ClientError:
+    return ClientError({"Error": {"Code": code, "Message": "x"}}, "Converse")
 
 
 @pytest.fixture
@@ -162,7 +209,7 @@ def decision(snapshot: ClientSnapshot) -> BillDecision:
     return build_decision(snapshot)
 
 
-def _draft(**overrides: Any) -> RecommendationDraft:
+def _draft(**overrides: Any) -> dict[str, Any]:
     values: dict[str, Any] = {
         "status": "action_required",
         "recommended_option_id": "credit_card",
@@ -174,26 +221,29 @@ def _draft(**overrides: Any) -> RecommendationDraft:
         "trade_offs": ["Withdraw from savings: 12.40 RON in forfeited interest."],
     }
     values.update(overrides)
-    return RecommendationDraft(**values)
+    return values
 
 
 def test_service_uses_model_output_when_consistent(decision: BillDecision) -> None:
-    service, stub = _service(_StubResponse(_draft()))
+    service, stub = _service(_tool_response(_draft()))
 
     result = service.recommend(decision)
 
     assert result.generated_by == "llm"
     assert result.headline.startswith("Pay the Enel Energie bill")
-    call = stub.responses.calls[0]
-    assert call["text_format"] is RecommendationDraft
-    assert call["model"] == "test-model"
-    assert "Pre-computed decision" in call["input"]
+    call = stub.calls[0]
+    assert call["modelId"] == "test-model"
+    tool = call["toolConfig"]["tools"][0]["toolSpec"]
+    assert tool["name"] == TOOL_NAME
+    assert tool["inputSchema"]["json"] == RecommendationDraft.model_json_schema()
+    prompt = call["messages"][0]["content"][0]["text"]
+    assert "Pre-computed decision" in prompt
     # Raw transactions never reach the model.
-    assert "TXN-" not in call["input"]
+    assert "TXN-" not in prompt
 
 
 def test_service_rejects_different_option(decision: BillDecision) -> None:
-    service, _ = _service(_StubResponse(_draft(recommended_option_id="savings")))
+    service, _ = _service(_tool_response(_draft(recommended_option_id="savings")))
 
     result = service.recommend(decision)
 
@@ -203,7 +253,7 @@ def test_service_rejects_different_option(decision: BillDecision) -> None:
 
 
 def test_service_rejects_invented_amount(decision: BillDecision) -> None:
-    service, _ = _service(_StubResponse(_draft(reasons=["You would pay 999.99 RON."])))
+    service, _ = _service(_tool_response(_draft(reasons=["You would pay 999.99 RON."])))
 
     result = service.recommend(decision)
 
@@ -212,40 +262,36 @@ def test_service_rejects_invented_amount(decision: BillDecision) -> None:
 
 
 def test_service_rejects_wrong_status(decision: BillDecision) -> None:
-    service, _ = _service(_StubResponse(_draft(status="no_risk")))
+    service, _ = _service(_tool_response(_draft(status="no_risk")))
     assert service.recommend(decision).generated_by == "rules"
 
 
 @pytest.mark.parametrize(
     ("response", "error"),
     [
-        (_StubResponse(None), AgentEmptyResponseError),
-        (_StubResponse(None, refusal=True), AgentRefusalError),
-        (_StubResponse(None, status="failed"), AgentProviderError),
+        (_tool_response(None, stop="end_turn"), AgentEmptyResponseError),
+        (_tool_response({"headline": "missing fields"}), AgentEmptyResponseError),
+        (_tool_response(None, stop="guardrail_intervened"), AgentRefusalError),
+        (_client_error("ThrottlingException"), AgentProviderError),
+        (_client_error("ExpiredTokenException"), AgentConfigurationError),
+        (ReadTimeoutError(endpoint_url="https://bedrock"), AgentProviderError),
     ],
 )
 def test_service_draft_raises_and_recommend_falls_back(
-    decision: BillDecision, response: _StubResponse, error: type[Exception]
+    decision: BillDecision, response: Any, error: type[Exception]
 ) -> None:
     service, _ = _service(response)
 
     with pytest.raises(error):
         service.draft(decision)
-    assert service.recommend(decision).generated_by == "rules"
-
-
-def test_service_translates_provider_errors(decision: BillDecision) -> None:
-    from openai import APIConnectionError
-
-    service, _ = _service(APIConnectionError(request=None))  # type: ignore[arg-type]
-
-    with pytest.raises(AgentProviderError):
-        service.draft(decision)
     result = service.recommend(decision)
     assert result.generated_by == "rules"
-    assert "sk-" not in (result.fallback_reason or "")
+    assert result.recommended_option_id == "credit_card"
 
 
-def test_service_requires_api_key_for_draft(decision: BillDecision) -> None:
+def test_service_without_credentials_uses_rules(decision: BillDecision) -> None:
     with pytest.raises(AgentConfigurationError):
-        AIAgentService(api_key=None).draft(decision)
+        AIAgentService().draft(decision)
+    result = AIAgentService().recommend(decision)
+    assert result.generated_by == "rules"
+    assert result.fallback_reason == "AI provider not configured"

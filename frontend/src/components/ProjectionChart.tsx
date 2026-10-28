@@ -1,15 +1,23 @@
 "use client";
 
-import { useId, useState, type KeyboardEvent, type PointerEvent } from "react";
+import {
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type PointerEvent,
+} from "react";
 
 import { formatDay, formatLongDay, formatRon } from "@/lib/format";
 import type { Projection } from "@/lib/types";
 
-const WIDTH = 640;
-const HEIGHT = 240;
-const PAD = { top: 24, right: 20, bottom: 30, left: 56 };
-const INNER_W = WIDTH - PAD.left - PAD.right;
-const INNER_H = HEIGHT - PAD.top - PAD.bottom;
+// Width used for the server render, before the container is measured.
+const DEFAULT_WIDTH = 640;
+// Narrower than this, labels need room the axis would take: tighter layout.
+const NARROW = 480;
+// Closest two x-axis date labels may sit, in pixels.
+const MIN_LABEL_GAP = 64;
 
 const compact = new Intl.NumberFormat("en-GB", { notation: "compact", maximumFractionDigits: 1 });
 
@@ -25,10 +33,31 @@ function niceStep(raw: number): number {
  * The y-axis is fitted to the days before the next income so a small deficit
  * stays visible; the payday balance, usually far higher, is pinned to the top
  * edge with a direct label. Exact values are in the tooltip and the table.
+ * The chart lays out in real pixels for its container, so text stays readable
+ * on a phone instead of being scaled down.
  */
 export function ProjectionChart({ projection }: { projection: Projection }) {
   const titleId = useId();
+  const boxRef = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(DEFAULT_WIDTH);
   const [active, setActive] = useState<number | null>(null);
+
+  useEffect(() => {
+    const box = boxRef.current;
+    if (!box) return;
+    const observer = new ResizeObserver(([entry]) => {
+      setWidth(Math.max(260, Math.round(entry.contentRect.width)));
+    });
+    observer.observe(box);
+    return () => observer.disconnect();
+  }, []);
+
+  const narrow = width < NARROW;
+  const height = narrow ? 220 : 240;
+  const pad = { top: 24, right: narrow ? 12 : 20, bottom: 30, left: narrow ? 40 : 56 };
+  const innerW = width - pad.left - pad.right;
+  const innerH = height - pad.top - pad.bottom;
+
   const points = projection.points;
   const count = points.length;
 
@@ -43,10 +72,10 @@ export function ProjectionChart({ projection }: { projection: Projection }) {
   const yMax = Math.ceil((dataMax + step * 0.25) / step) * step;
   const yMin = Math.floor((dataMin - (dataMin < 0 ? step * 0.25 : 0)) / step) * step;
 
-  const dx = INNER_W / Math.max(count - 1, 1);
-  const x = (i: number) => PAD.left + i * dx;
+  const dx = innerW / Math.max(count - 1, 1);
+  const x = (i: number) => pad.left + i * dx;
   const y = (v: number) =>
-    PAD.top + ((yMax - Math.min(Math.max(v, yMin), yMax)) / (yMax - yMin)) * INNER_H;
+    pad.top + ((yMax - Math.min(Math.max(v, yMin), yMax)) / (yMax - yMin)) * innerH;
 
   const ticks: number[] = [];
   for (let v = yMin; v <= yMax + step / 2; v += step) ticks.push(v);
@@ -64,14 +93,20 @@ export function ProjectionChart({ projection }: { projection: Projection }) {
   const last = points[count - 1];
   const lastOffScale = last.balance > yMax;
 
-  const xLabels = Array.from(
-    new Set([0, negative[0] ?? -1, count - 1].filter((i) => i >= 0)),
-  );
+  // First and last day always; the first negative day only if it has room.
+  const xLabels = [0, count - 1];
+  const deficitIndex = negative[0];
+  if (
+    deficitIndex !== undefined &&
+    xLabels.every((i) => Math.abs(x(i) - x(deficitIndex)) >= MIN_LABEL_GAP)
+  ) {
+    xLabels.splice(1, 0, deficitIndex);
+  }
 
   function pick(event: PointerEvent<SVGSVGElement>) {
     const box = event.currentTarget.getBoundingClientRect();
-    const px = ((event.clientX - box.left) / box.width) * WIDTH;
-    setActive(Math.min(count - 1, Math.max(0, Math.round((px - PAD.left) / dx))));
+    const px = ((event.clientX - box.left) / box.width) * width;
+    setActive(Math.min(count - 1, Math.max(0, Math.round((px - pad.left) / dx))));
   }
 
   function onKeyDown(event: KeyboardEvent<SVGSVGElement>) {
@@ -91,10 +126,12 @@ export function ProjectionChart({ projection }: { projection: Projection }) {
         {formatLongDay(last.date)}.
       </figcaption>
 
-      <div className="relative">
+      <div ref={boxRef} className="relative">
         <svg
-          viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
-          className="h-auto w-full touch-none select-none"
+          width={width}
+          height={height}
+          viewBox={`0 0 ${width} ${height}`}
+          className="block w-full touch-none select-none"
           role="group"
           aria-labelledby={titleId}
           tabIndex={0}
@@ -109,20 +146,20 @@ export function ProjectionChart({ projection }: { projection: Projection }) {
             <g>
               <rect
                 x={bandStart}
-                y={PAD.top}
+                y={pad.top}
                 width={Math.max(bandEnd - bandStart, 2)}
-                height={INNER_H}
+                height={innerH}
                 className="fill-red-600/10 dark:fill-red-400/15"
               />
               <circle
                 cx={bandStart + 8}
-                cy={PAD.top - 10}
+                cy={pad.top - 10}
                 r={4}
                 className="fill-red-600 dark:fill-red-400"
               />
               <text
                 x={bandStart + 16}
-                y={PAD.top - 6}
+                y={pad.top - 6}
                 className="fill-[var(--foreground)] text-[11px] font-medium"
               >
                 Overdraft · {projection.deficit_days} {projection.deficit_days === 1 ? "day" : "days"}
@@ -133,15 +170,15 @@ export function ProjectionChart({ projection }: { projection: Projection }) {
           {ticks.map((v) => (
             <g key={v}>
               <line
-                x1={PAD.left}
-                x2={WIDTH - PAD.right}
+                x1={pad.left}
+                x2={width - pad.right}
                 y1={y(v)}
                 y2={y(v)}
                 strokeWidth={1}
                 className={v === 0 ? "stroke-[var(--muted)]" : "stroke-[var(--border)]"}
               />
               <text
-                x={PAD.left - 8}
+                x={pad.left - 8}
                 y={y(v) + 4}
                 textAnchor="end"
                 className="fill-[var(--muted)] text-[11px] tabular-nums"
@@ -155,7 +192,7 @@ export function ProjectionChart({ projection }: { projection: Projection }) {
             <text
               key={i}
               x={x(i)}
-              y={HEIGHT - 8}
+              y={height - 8}
               textAnchor={i === 0 ? "start" : i === count - 1 ? "end" : "middle"}
               className="fill-[var(--muted)] text-[11px]"
             >
@@ -196,7 +233,7 @@ export function ProjectionChart({ projection }: { projection: Projection }) {
           {lastOffScale && (
             <text
               x={x(count - 1) - 8}
-              y={PAD.top + 12}
+              y={pad.top + 12}
               textAnchor="end"
               className="fill-[var(--foreground)] text-[11px] font-medium tabular-nums"
             >
@@ -209,8 +246,8 @@ export function ProjectionChart({ projection }: { projection: Projection }) {
               <line
                 x1={x(active)}
                 x2={x(active)}
-                y1={PAD.top}
-                y2={PAD.top + INNER_H}
+                y1={pad.top}
+                y2={pad.top + innerH}
                 strokeWidth={1}
                 className="stroke-[var(--muted)]"
               />
@@ -229,7 +266,7 @@ export function ProjectionChart({ projection }: { projection: Projection }) {
           <div
             role="status"
             className="pointer-events-none absolute top-0 z-10 min-w-36 -translate-x-1/2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-xs shadow-md"
-            style={{ left: `${Math.min(88, Math.max(12, (x(active) / WIDTH) * 100))}%` }}
+            style={{ left: Math.min(width - 76, Math.max(76, x(active))) }}
           >
             <p className="text-sm font-semibold tabular-nums">
               {formatRon(activePoint.balance)}

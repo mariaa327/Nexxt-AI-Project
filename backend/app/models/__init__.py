@@ -1,5 +1,5 @@
-"""ORM models. Imported so SQLAlchemy registers their metadata."""
+"""ORM models, imported so SQLAlchemy registers both metadata sets."""
 
-from app.models.domain import AgentTask
+from app.models import client, directory
 
-__all__ = ["AgentTask"]
+__all__ = ["client", "directory"]

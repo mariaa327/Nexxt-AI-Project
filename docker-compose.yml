@@ -2,11 +2,29 @@
 # Docker Compose for local development.
 #
 # Copy the root .env.example to .env first; Compose reads that file for the
-# variable interpolation below. There is no database container: PostgreSQL is
-# optional and external (e.g. Supabase); without it analyses are not stored.
+# variable interpolation below. The "db" service is PostgreSQL holding the
+# directory database and one database per fictional client.
 # ---------------------------------------------------------------------------
 
 services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      # Development-only credentials for the local demo database.
+      POSTGRES_USER: ${POSTGRES_USER:-bank}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-bank}
+      POSTGRES_DB: postgres
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - bank-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bank} -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
   backend:
     build:
       context: ./backend
@@ -14,12 +32,16 @@ services:
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     environment:
-      DATABASE_URL: ${DATABASE_URL:-}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
+      # Inside Compose the server is reachable as "db", not localhost.
+      DATABASE_ADMIN_URL: postgresql://${POSTGRES_USER:-bank}:${POSTGRES_PASSWORD:-bank}@db:5432/postgres
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-west-2}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      BEDROCK_MODEL_ID: ${BEDROCK_MODEL_ID:-us.anthropic.claude-sonnet-5-5}
       DEMO_TODAY: ${DEMO_TODAY:-}
       CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:3000"]}
-      AUTO_CREATE_TABLES: ${AUTO_CREATE_TABLES:-true}
     healthcheck:
       test:
         - CMD
@@ -30,6 +52,9 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    depends_on:
+      db:
+        condition: service_healthy
     restart: unless-stopped
 
   frontend:
@@ -46,3 +71,6 @@ services:
       backend:
         condition: service_healthy
     restart: unless-stopped
+
+volumes:
+  bank-data:

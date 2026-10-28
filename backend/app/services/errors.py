@@ -23,7 +23,7 @@ class AgentConfigurationError(AgentServiceError):
 
     http_status = 503
     public_message = (
-        "The AI service is not configured. Set OPENAI_API_KEY on the backend."
+        "The AI service is not configured. Set the AWS credentials on the backend."
     )
 
 
@@ -60,3 +60,56 @@ class OptionNotAvailableError(AgentServiceError):
 
     http_status = 422
     public_message = "That option is not available for the current situation."
+
+
+class ChallengeNotFoundError(AgentServiceError):
+    """No verification request with that id (or the demo was reset)."""
+
+    http_status = 404
+    public_message = "Verification request not found. Start the payment again."
+
+
+class ChallengeNotApprovedError(AgentServiceError):
+    """The verification is still pending, was cancelled, or was already used."""
+
+    http_status = 409
+    public_message = "The payment has not been approved in the banking app."
+
+
+class ChallengeExpiredError(AgentServiceError):
+    """The verification request timed out."""
+
+    http_status = 410
+    public_message = "The verification request expired. Start the payment again."
+
+
+class NotAuthenticatedError(AgentServiceError):
+    """Missing, invalid or expired session token."""
+
+    http_status = 401
+    public_message = "Please log in again."
+
+
+class InvalidCredentialsError(AgentServiceError):
+    """Wrong username or password; deliberately does not say which."""
+
+    http_status = 401
+    public_message = "Incorrect username or password."
+
+
+class DatabaseUnavailableError(AgentServiceError):
+    http_status = 503
+    public_message = "The bank database is unavailable. Is PostgreSQL running?"
+
+
+class InvalidClientDataError(AgentServiceError):
+    """Client data does not match the expected format."""
+
+    http_status = 422
+    public_message = "The client data is not in the expected format."
+
+    def __init__(self, reason: str | None = None) -> None:
+        super().__init__(reason)
+        if reason:
+            # The reason names fields of the data file, never server internals.
+            self.public_message = f"Invalid client data: {reason}"

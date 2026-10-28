@@ -4,7 +4,7 @@ sqlalchemy==2.1.6
 pydantic==2.14.1
 pydantic-settings==2.16.1
 psycopg[binary]==3.3.6
-openai==3.40.0
+boto3==1.43.120
 
 # Testing
 pytest==9.1.1

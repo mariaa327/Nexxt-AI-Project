@@ -1,4 +1,11 @@
 {
+  "user": {
+    "username": "andrei",
+    "display_name": "Andrei Popescu",
+    "password": "overdraft2026",
+    "caption": "A utility bill will empty his current account",
+    "position": 1
+  },
   "as_of_date": "2026-10-28",
   "customer": {
     "customer_id": "CUST-883921",
