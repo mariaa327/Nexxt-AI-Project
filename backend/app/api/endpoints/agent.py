@@ -1,81 +1,68 @@
-"""Agent endpoint: run the AI agent and persist the result for the user."""
+"""Agent endpoints: analyse the situation, execute an option, reset the demo."""
 
 from __future__ import annotations
 
-import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.exc import SQLAlchemyError
+from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
-from app.core.database import get_db
-from app.core.security import CurrentUser, get_current_user
-from app.models.domain import AgentTask
-from app.schemas.agent import AgentOutput, AgentRunRequest, AgentRunResponse
-from app.services.ai_agent import AgentServiceError, AIAgentService
-
-logger = logging.getLogger(__name__)
+from app.api.deps import get_agent_service, get_demo_state
+from app.core.database import maybe_get_db
+from app.schemas.insights import (
+    AnalyzeResponse,
+    BillDecision,
+    ExecuteRequest,
+    ExecuteResponse,
+)
+from app.services.ai_agent import AIAgentService
+from app.services.banking.engine import build_decision
+from app.services.banking.executor import DemoState
+from app.services.persistence import save_analysis
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 
 
-def get_agent_service() -> AIAgentService:
-    """Service provider kept as a dependency so tests can override it."""
-    return AIAgentService()
+@router.post(
+    "/analyze",
+    response_model=AnalyzeResponse,
+    summary="Compute the decision and phrase the recommendation",
+)
+def analyze(
+    state: Annotated[DemoState, Depends(get_demo_state)],
+    agent: Annotated[AIAgentService, Depends(get_agent_service)],
+    db: Annotated[Session | None, Depends(maybe_get_db)],
+) -> AnalyzeResponse:
+    snapshot = state.snapshot()
+    decision = build_decision(snapshot)
+    recommendation = agent.recommend(decision)
+    task_id = save_analysis(db, snapshot.customer.customer_id, decision, recommendation)
+    return AnalyzeResponse(
+        decision=decision,
+        recommendation=recommendation,
+        task_id=task_id,
+        persisted=task_id is not None,
+    )
 
 
 @router.post(
-    "/run",
-    response_model=AgentRunResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Run the AI agent for the authenticated user",
-    responses={
-        401: {"description": "Missing or invalid bearer token"},
-        422: {"description": "Invalid prompt or model refusal"},
-        500: {"description": "Server misconfiguration"},
-        502: {"description": "AI provider error"},
-        503: {"description": "Database or AI service unavailable"},
-    },
+    "/execute",
+    response_model=ExecuteResponse,
+    summary="Apply an option to the demo client (simulated)",
+    responses={422: {"description": "Option not available"}},
 )
-def run_agent(
-    payload: AgentRunRequest,
-    user: Annotated[CurrentUser, Depends(get_current_user)],
-    db: Annotated[Session, Depends(get_db)],
-    agent: Annotated[AIAgentService, Depends(get_agent_service)],
-) -> AgentRunResponse:
-    """Run the agent, store the task, and return the structured result."""
-    try:
-        result: AgentOutput = agent.run(payload.prompt)
-    except AgentServiceError as exc:
-        # Service exceptions carry safe, human-readable messages.
-        raise HTTPException(
-            status_code=exc.http_status, detail=exc.public_message
-        ) from exc
-
-    task = AgentTask(
-        user_id=user.user_id,
-        prompt=payload.prompt,
-        result=result.model_dump(mode="json"),
-    )
-
-    try:
-        db.add(task)
-        db.commit()
-        db.refresh(task)
-    except SQLAlchemyError as exc:
-        db.rollback()
-        logger.error("Failed to persist agent task: %s", type(exc).__name__)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="The database is unavailable. Please try again later.",
-        ) from exc
-
-    return AgentRunResponse(
-        id=task.id,
-        result=AgentOutput.model_validate(task.result),
-        created_at=task.created_at,
-    )
+def execute(
+    payload: ExecuteRequest,
+    state: Annotated[DemoState, Depends(get_demo_state)],
+) -> ExecuteResponse:
+    return state.execute(payload.option_id)
 
 
-__all__ = ["get_agent_service", "router"]
+@router.post(
+    "/reset",
+    response_model=BillDecision,
+    summary="Reload the demo client's original data",
+)
+def reset(state: Annotated[DemoState, Depends(get_demo_state)]) -> BillDecision:
+    state.reset()
+    return build_decision(state.snapshot())

@@ -1,5 +1,9 @@
-import type { AgentOutput } from "@/lib/types";
-import { getSupabaseBrowserClient } from "@/lib/supabase/client";
+import type {
+  AnalyzeResponse,
+  BillDecision,
+  ExecuteResponse,
+  OptionId,
+} from "@/lib/types";
 
 /**
  * Base URL of the FastAPI backend, including the `/api` prefix.
@@ -31,43 +35,19 @@ export function getApiBaseUrl(): string {
 type RequestOptions = {
   method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
   body?: unknown;
-  /** Skip attaching the Supabase access token (public endpoints). */
-  anonymous?: boolean;
   signal?: AbortSignal;
 };
-
-async function getAccessToken(): Promise<string | null> {
-  const supabase = getSupabaseBrowserClient();
-  if (!supabase) {
-    return null;
-  }
-
-  const { data, error } = await supabase.auth.getSession();
-  if (error) {
-    throw new ApiError("Could not read your Supabase session. Please sign in again.", 401);
-  }
-  return data.session?.access_token ?? null;
-}
 
 /**
  * Typed wrapper around `fetch` for the FastAPI backend.
  *
- * Attaches the current Supabase access token, sets JSON headers, and converts
- * network, HTTP and parsing failures into `ApiError` instances with readable
- * messages.
+ * Sets JSON headers and converts network, HTTP and parsing failures into
+ * `ApiError` instances with readable messages.
  */
 export async function apiRequest<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const { method = "GET", body, anonymous = false, signal } = options;
+  const { method = "GET", body, signal } = options;
 
   const headers: Record<string, string> = { Accept: "application/json" };
-
-  if (!anonymous) {
-    const token = await getAccessToken();
-    if (!token) {
-      throw new ApiError("You need to sign in before using this feature.", 401);
-    }
-    headers.Authorization = `Bearer ${token}`;
-  }
 
   if (body !== undefined) {
     headers["Content-Type"] = "application/json";
@@ -148,17 +128,25 @@ async function extractErrorMessage(response: Response): Promise<string> {
 
 // --- Typed API functions ---------------------------------------------------
 
-export type AgentRunResponse = {
-  id: string;
-  result: AgentOutput;
-  created_at: string;
-};
+/** Deterministic picture: balances, upcoming payments, projection, options. */
+export function getDashboard(signal?: AbortSignal): Promise<BillDecision> {
+  return apiRequest<BillDecision>("/dashboard", { signal });
+}
 
-/** Run the AI agent. Requires a signed-in Supabase user. */
-export function runAgent(prompt: string, signal?: AbortSignal): Promise<AgentRunResponse> {
-  return apiRequest<AgentRunResponse>("/agent/run", {
+/** Engine decision plus the recommendation phrased by the model (or rules). */
+export function analyze(signal?: AbortSignal): Promise<AnalyzeResponse> {
+  return apiRequest<AnalyzeResponse>("/agent/analyze", { method: "POST", signal });
+}
+
+/** Apply an option to the demo client (simulated, in memory). */
+export function executeOption(optionId: OptionId): Promise<ExecuteResponse> {
+  return apiRequest<ExecuteResponse>("/agent/execute", {
     method: "POST",
-    body: { prompt },
-    signal,
+    body: { option_id: optionId },
   });
+}
+
+/** Restore the demo client's original data. */
+export function resetDemo(): Promise<BillDecision> {
+  return apiRequest<BillDecision>("/agent/reset", { method: "POST" });
 }

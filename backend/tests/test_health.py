@@ -9,7 +9,7 @@ from app.main import app
 
 def test_health_returns_ok_without_credentials() -> None:
     # A plain client (no dependency overrides) proves the endpoint works with
-    # no database, Supabase or AI configuration.
+    # no database or AI configuration.
     with TestClient(app) as client:
         response = client.get("/api/health")
 
@@ -18,8 +18,8 @@ def test_health_returns_ok_without_credentials() -> None:
     assert body["status"] == "ok"
     assert body["integrations"] == {
         "database_configured": False,
-        "supabase_auth_configured": False,
         "ai_configured": False,
+        "demo_data_loaded": True,
     }
 
 
@@ -29,5 +29,12 @@ def test_openapi_document_is_exposed() -> None:
 
     assert response.status_code == 200
     paths = response.json()["paths"]
-    assert "/api/health" in paths
-    assert "/api/agent/run" in paths
+    for path in (
+        "/api/health",
+        "/api/dashboard",
+        "/api/agent/analyze",
+        "/api/agent/execute",
+        "/api/agent/reset",
+    ):
+        assert path in paths
+    assert "/api/agent/run" not in paths

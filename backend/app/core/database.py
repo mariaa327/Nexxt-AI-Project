@@ -140,6 +140,22 @@ def get_db() -> Generator[Session, Any, None]:
         session.close()
 
 
+def maybe_get_db() -> Generator[Session | None, Any, None]:
+    """Like ``get_db``, but yields ``None`` when the database is not configured.
+
+    For endpoints where persistence is optional and must not block the response.
+    """
+    try:
+        session = get_session_factory()()
+    except DatabaseNotConfiguredError:
+        yield None
+        return
+    try:
+        yield session
+    finally:
+        session.close()
+
+
 def reset_engine() -> None:
     """Dispose and forget the cached engine (used by tests)."""
     global _engine, _session_factory

@@ -6,12 +6,14 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.api.router import api_router
 from app.core.config import settings
 from app.core.database import Base, DatabaseNotConfiguredError, get_engine
+from app.services.errors import AgentServiceError
 
 logging.basicConfig(level=settings.log_level.upper())
 logger = logging.getLogger(__name__)
@@ -47,11 +49,23 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(
-    title="AI Hackathon API",
-    description="Starter backend: Supabase-authenticated AI agent runs persisted to PostgreSQL.",
-    version="0.1.0",
+    title="Overdraft Agent API",
+    description=(
+        "Deterministic overdraft forecasting and option pricing, phrased by an LLM. "
+        "Single demo client, no authentication."
+    ),
+    version="0.2.0",
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(AgentServiceError)
+def handle_service_error(_: Request, exc: AgentServiceError) -> JSONResponse:
+    """Service errors carry safe, human-readable messages."""
+    return JSONResponse(
+        status_code=exc.http_status, content={"detail": exc.public_message}
+    )
+
 
 app.add_middleware(
     CORSMiddleware,

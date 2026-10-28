@@ -6,6 +6,7 @@ start and expose its health check without any external credentials.
 """
 
 import json
+from datetime import date
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any
@@ -33,20 +34,18 @@ class Settings(BaseSettings):
     )
 
     # --- Database (Supabase PostgreSQL) -------------------------------------
+    # Optional: analyses are persisted when set, and skipped when not.
     database_url: str | None = None
-
-    # --- Supabase Auth ------------------------------------------------------
-    supabase_url: str | None = None
-    supabase_jwks_url: str | None = None
-    # Legacy HS256 shared secret. Only used when explicitly configured and the
-    # token header says HS256. Modern projects use asymmetric signing keys.
-    supabase_jwt_secret: str | None = None
-    # Supabase access tokens use "authenticated" for signed-in users.
-    supabase_jwt_audience: str = "authenticated"
 
     # --- AI provider --------------------------------------------------------
     openai_api_key: str | None = None
     openai_model: str = "gpt-4.1-mini"
+
+    # --- Demo client data ---------------------------------------------------
+    # Defaults to app/data/client1_date.json, which ships in the Docker image.
+    demo_data_path: Path | None = None
+    # Overrides the data file's ``as_of_date`` ("today" for the projection).
+    demo_today: date | None = None
 
     # --- Application --------------------------------------------------------
     # NoDecode keeps pydantic-settings from treating the JSON array as a
@@ -61,11 +60,9 @@ class Settings(BaseSettings):
 
     @field_validator(
         "database_url",
-        "supabase_url",
-        "supabase_jwks_url",
-        "supabase_jwt_secret",
-        "supabase_jwt_audience",
         "openai_api_key",
+        "demo_data_path",
+        "demo_today",
         mode="before",
     )
     @classmethod
@@ -100,24 +97,6 @@ class Settings(BaseSettings):
                 return [str(item).strip() for item in parsed if str(item).strip()]
             return [item.strip() for item in text.split(",") if item.strip()]
         return value
-
-    # Derived helpers --------------------------------------------------------
-
-    @property
-    def supabase_issuer(self) -> str | None:
-        """Expected ``iss`` claim for Supabase-issued access tokens."""
-        if not self.supabase_url:
-            return None
-        return f"{self.supabase_url.rstrip('/')}/auth/v1"
-
-    @property
-    def resolved_jwks_url(self) -> str | None:
-        """JWKS endpoint used to fetch Supabase's asymmetric signing keys."""
-        if self.supabase_jwks_url:
-            return self.supabase_jwks_url
-        if self.supabase_url:
-            return f"{self.supabase_url.rstrip('/')}/auth/v1/.well-known/jwks.json"
-        return None
 
 
 @lru_cache

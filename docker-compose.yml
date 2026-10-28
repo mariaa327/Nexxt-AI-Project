@@ -2,8 +2,8 @@
 # Docker Compose for local development.
 #
 # Copy the root .env.example to .env first; Compose reads that file for the
-# variable interpolation below. PostgreSQL is hosted by Supabase, so there is
-# no database container here.
+# variable interpolation below. There is no database container: PostgreSQL is
+# optional and external (e.g. Supabase); without it analyses are not stored.
 # ---------------------------------------------------------------------------
 
 services:
@@ -15,11 +15,9 @@ services:
       - "${BACKEND_PORT:-8000}:8000"
     environment:
       DATABASE_URL: ${DATABASE_URL:-}
-      SUPABASE_URL: ${SUPABASE_URL:-}
-      SUPABASE_JWKS_URL: ${SUPABASE_JWKS_URL:-}
-      SUPABASE_JWT_SECRET: ${SUPABASE_JWT_SECRET:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
+      DEMO_TODAY: ${DEMO_TODAY:-}
       CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:3000"]}
       AUTO_CREATE_TABLES: ${AUTO_CREATE_TABLES:-true}
     healthcheck:
@@ -39,11 +37,8 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       args:
-        # Public values baked into the client bundle at build time. The API URL
+        # Public value baked into the client bundle at build time. The API URL
         # is the one the *browser* uses, so it must be reachable from the host.
-        NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
-        NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY:-}
-        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY:-}
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000/api}
     ports:
       - "${FRONTEND_PORT:-3000}:3000"

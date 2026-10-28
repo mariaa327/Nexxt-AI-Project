@@ -12,9 +12,9 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
-  title: "AI Hackathon Starter",
+  title: "Overdraft Guard",
   description:
-    "Next.js, FastAPI and Supabase starter for building AI features quickly.",
+    "An agent that anticipates your bills and finds the cheapest way to avoid an overdraft.",
 };
 
 export default function RootLayout({
@@ -28,8 +28,8 @@ export default function RootLayout({
           <main className="flex-1">{children}</main>
           <footer className="border-t border-[var(--border)] px-4 py-6 text-sm text-[var(--muted)] sm:px-6">
             <div className="mx-auto flex max-w-5xl flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
-              <span>AI Hackathon Starter — Next.js + FastAPI + Supabase</span>
-              <span>Built for fast iteration, not production hardening.</span>
+              <span>Overdraft Guard — hackathon demo with simulated data</span>
+              <span>Transfers are simulated; no real bank is contacted.</span>
             </div>
           </footer>
         </div>

@@ -9,144 +9,116 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.api.endpoints.agent import get_agent_service
-from app.core.database import get_db
-from app.core.security import CurrentUser, get_current_user
+from app.api.deps import get_agent_service, get_demo_state
+from app.core.database import maybe_get_db
 from app.main import app
 from app.models.domain import AgentTask
-from app.schemas.agent import AgentOutput
-from app.services.ai_agent import (
+from app.schemas.banking import ClientSnapshot
+from app.schemas.insights import BillDecision, RecommendationDraft
+from app.services.ai_agent import AIAgentService
+from app.services.banking.engine import build_decision
+from app.services.banking.executor import DemoState
+from app.services.errors import (
     AgentConfigurationError,
     AgentEmptyResponseError,
     AgentProviderError,
     AgentRefusalError,
-    AIAgentService,
 )
-from tests.conftest import FakeAgentService
+
+# --- Endpoints --------------------------------------------------------------
 
 
-@pytest.fixture
-def agent_client(
-    db_session: Session, fake_agent: FakeAgentService
-) -> Generator[TestClient, None, None]:
-    def override_get_db() -> Generator[Session, None, None]:
-        yield db_session
+def test_dashboard_returns_engine_numbers(client: TestClient) -> None:
+    response = client.get("/api/dashboard")
 
-    app.dependency_overrides[get_db] = override_get_db
-    app.dependency_overrides[get_agent_service] = lambda: fake_agent
-    app.dependency_overrides[get_current_user] = lambda: CurrentUser(
-        user_id="test-user-id", claims={"sub": "test-user-id"}
-    )
-    with TestClient(app) as client:
-        yield client
-    app.dependency_overrides.clear()
-
-
-def test_agent_run_persists_task_for_authenticated_user(
-    agent_client: TestClient, db_session: Session, fake_agent: FakeAgentService
-) -> None:
-    response = agent_client.post(
-        "/api/agent/run", json={"prompt": "Explain embeddings"}
-    )
-
-    assert response.status_code == 201
+    assert response.status_code == 200
     body = response.json()
-    assert body["result"]["answer"] == fake_agent.result.answer
-    assert body["result"]["key_points"] == fake_agent.result.key_points
-    assert body["id"]
+    assert body["projection"]["first_deficit_date"] == "2026-11-05"
+    assert body["projection"]["peak_deficit"] == 318.4
+    assert [(o["option_id"], o["cost"]) for o in body["options"]] == [
+        ("credit_card", 0.0),
+        ("savings", 12.4),
+        ("overdraft", 31.19),
+    ]
+
+
+def test_analyze_without_ai_key_uses_rules_and_persists(
+    client: TestClient, db_session: Session
+) -> None:
+    response = client.post("/api/agent/analyze")
+
+    assert response.status_code == 200
+    body = response.json()
+    recommendation = body["recommendation"]
+    assert recommendation["generated_by"] == "rules"
+    assert recommendation["fallback_reason"] == "AI provider not configured"
+    assert recommendation["recommended_option_id"] == "credit_card"
+    assert recommendation["reasons"]
+    assert body["persisted"] is True
 
     task = db_session.query(AgentTask).one()
-    assert task.user_id == "test-user-id"
-    assert task.prompt == "Explain embeddings"
-    assert task.result["answer"] == fake_agent.result.answer
-    assert task.created_at is not None
+    assert task.customer_id == "CUST-883921"
+    assert str(task.id) == body["task_id"]
 
 
-@pytest.mark.parametrize("prompt", ["", "   ", "\n\t "])
-def test_agent_run_rejects_blank_prompt(agent_client: TestClient, prompt: str) -> None:
-    response = agent_client.post("/api/agent/run", json={"prompt": prompt})
+def test_analyze_without_database_still_succeeds(state: DemoState) -> None:
+    def no_db() -> Generator[None, None, None]:
+        yield None
 
-    assert response.status_code == 422
-
-
-def test_agent_run_rejects_prompt_over_limit(agent_client: TestClient) -> None:
-    response = agent_client.post("/api/agent/run", json={"prompt": "a" * 5000})
-
-    assert response.status_code == 422
-
-
-def test_agent_run_returns_503_when_ai_not_configured(
-    agent_client: TestClient, fake_agent: FakeAgentService
-) -> None:
-    fake_agent.error = AgentConfigurationError()
-
-    response = agent_client.post("/api/agent/run", json={"prompt": "Hello"})
-
-    assert response.status_code == 503
-    assert "OPENAI_API_KEY" in response.json()["detail"]
-
-
-def test_agent_run_returns_502_on_provider_error(
-    agent_client: TestClient, fake_agent: FakeAgentService
-) -> None:
-    fake_agent.error = AgentProviderError()
-
-    response = agent_client.post("/api/agent/run", json={"prompt": "Hello"})
-
-    assert response.status_code == 502
-    # No provider internals or stack traces leak to the client.
-    assert "Traceback" not in response.text
-    assert "sk-" not in response.text
-
-
-def test_agent_run_returns_422_on_refusal(
-    agent_client: TestClient, fake_agent: FakeAgentService
-) -> None:
-    fake_agent.error = AgentRefusalError()
-
-    response = agent_client.post("/api/agent/run", json={"prompt": "Hello"})
-
-    assert response.status_code == 422
-
-
-def test_agent_run_does_not_persist_on_failure(
-    agent_client: TestClient, db_session: Session, fake_agent: FakeAgentService
-) -> None:
-    fake_agent.error = AgentProviderError()
-
-    agent_client.post("/api/agent/run", json={"prompt": "Hello"})
-
-    assert db_session.query(AgentTask).count() == 0
-
-
-def test_agent_run_requires_database_configuration(
-    monkeypatch: pytest.MonkeyPatch, fake_agent: FakeAgentService
-) -> None:
-    """Without DATABASE_URL the endpoint fails clearly instead of using SQLite."""
-    from app.core.config import settings
-
-    monkeypatch.setattr(settings, "database_url", None, raising=False)
-    app.dependency_overrides[get_agent_service] = lambda: fake_agent
-    app.dependency_overrides[get_current_user] = lambda: CurrentUser(
-        user_id="test-user-id", claims={"sub": "test-user-id"}
-    )
+    app.dependency_overrides[maybe_get_db] = no_db
+    app.dependency_overrides[get_demo_state] = lambda: state
+    app.dependency_overrides[get_agent_service] = lambda: AIAgentService(api_key=None)
     try:
         with TestClient(app) as client:
-            response = client.post("/api/agent/run", json={"prompt": "Hello"})
+            response = client.post("/api/agent/analyze")
     finally:
         app.dependency_overrides.clear()
 
-    assert response.status_code == 503
-    assert "DATABASE_URL" in response.json()["detail"]
+    assert response.status_code == 200
+    assert response.json()["persisted"] is False
+    assert response.json()["task_id"] is None
 
 
-# --- Service unit tests ----------------------------------------------------
+def test_execute_then_analyze_reports_no_risk(client: TestClient) -> None:
+    executed = client.post("/api/agent/execute", json={"option_id": "credit_card"})
+    assert executed.status_code == 200
+    assert executed.json()["decision_after"]["no_action_needed"] is True
+
+    analyzed = client.post("/api/agent/analyze").json()
+    assert analyzed["recommendation"]["status"] == "no_risk"
+
+
+def test_execute_rejects_unknown_option(client: TestClient) -> None:
+    response = client.post("/api/agent/execute", json={"option_id": "lottery"})
+    assert response.status_code == 422
+
+
+def test_execute_rejects_option_not_offered(client: TestClient) -> None:
+    client.post("/api/agent/execute", json={"option_id": "credit_card"})
+    response = client.post("/api/agent/execute", json={"option_id": "savings"})
+
+    assert response.status_code == 422
+    assert (
+        response.json()["detail"]
+        == "That option is not available for the current situation."
+    )
+
+
+def test_reset_restores_deficit(client: TestClient) -> None:
+    client.post("/api/agent/execute", json={"option_id": "credit_card"})
+    response = client.post("/api/agent/reset")
+
+    assert response.status_code == 200
+    assert response.json()["no_action_needed"] is False
+
+
+# --- Service ----------------------------------------------------------------
 
 
 class _StubResponse:
     def __init__(
         self,
-        parsed: AgentOutput | None,
+        parsed: RecommendationDraft | None,
         status: str = "completed",
         refusal: bool = False,
     ) -> None:
@@ -180,51 +152,100 @@ class _StubClient:
         self.responses = _StubResponses(response)
 
 
-def _output() -> AgentOutput:
-    return AgentOutput(answer="Answer", key_points=["a"], follow_up_questions=[])
+def _service(response: _StubResponse | Exception) -> tuple[AIAgentService, _StubClient]:
+    stub = _StubClient(response)
+    return AIAgentService(api_key="test-key", client=stub), stub  # type: ignore[arg-type]
 
 
-def test_service_requires_api_key() -> None:
-    service = AIAgentService(api_key=None)
-
-    with pytest.raises(AgentConfigurationError):
-        service.run("Hello")
+@pytest.fixture
+def decision(snapshot: ClientSnapshot) -> BillDecision:
+    return build_decision(snapshot)
 
 
-def test_service_returns_parsed_output() -> None:
-    client = _StubClient(_StubResponse(_output()))
-    service = AIAgentService(api_key="test-key", client=client)  # type: ignore[arg-type]
+def _draft(**overrides: Any) -> RecommendationDraft:
+    values: dict[str, Any] = {
+        "status": "action_required",
+        "recommended_option_id": "credit_card",
+        "headline": "Pay the Enel Energie bill of 618.40 RON with your credit card.",
+        "reasons": [
+            "Your account would go negative on 5 November, down to -318.40 RON.",
+            "Doing nothing would cost 31.19 RON.",
+        ],
+        "trade_offs": ["Withdraw from savings: 12.40 RON in forfeited interest."],
+    }
+    values.update(overrides)
+    return RecommendationDraft(**values)
 
-    result = service.run("Hello")
 
-    assert result.answer == "Answer"
-    call = client.responses.calls[0]
-    assert call["text_format"] is AgentOutput
+def test_service_uses_model_output_when_consistent(decision: BillDecision) -> None:
+    service, stub = _service(_StubResponse(_draft()))
+
+    result = service.recommend(decision)
+
+    assert result.generated_by == "llm"
+    assert result.headline.startswith("Pay the Enel Energie bill")
+    call = stub.responses.calls[0]
+    assert call["text_format"] is RecommendationDraft
     assert call["model"] == "test-model"
-    assert "Hello" in call["input"]
+    assert "Pre-computed decision" in call["input"]
+    # Raw transactions never reach the model.
+    assert "TXN-" not in call["input"]
 
 
-def test_service_raises_on_missing_parsed_output() -> None:
-    client = _StubClient(_StubResponse(None))
-    service = AIAgentService(api_key="test-key", client=client)  # type: ignore[arg-type]
+def test_service_rejects_different_option(decision: BillDecision) -> None:
+    service, _ = _service(_StubResponse(_draft(recommended_option_id="savings")))
 
-    with pytest.raises(AgentEmptyResponseError):
-        service.run("Hello")
+    result = service.recommend(decision)
 
-
-def test_service_raises_on_refusal() -> None:
-    client = _StubClient(_StubResponse(None, refusal=True))
-    service = AIAgentService(api_key="test-key", client=client)  # type: ignore[arg-type]
-
-    with pytest.raises(AgentRefusalError):
-        service.run("Hello")
+    assert result.generated_by == "rules"
+    assert result.recommended_option_id == "credit_card"
+    assert "differs from the engine" in (result.fallback_reason or "")
 
 
-def test_service_translates_provider_errors() -> None:
+def test_service_rejects_invented_amount(decision: BillDecision) -> None:
+    service, _ = _service(_StubResponse(_draft(reasons=["You would pay 999.99 RON."])))
+
+    result = service.recommend(decision)
+
+    assert result.generated_by == "rules"
+    assert "999.99" in (result.fallback_reason or "")
+
+
+def test_service_rejects_wrong_status(decision: BillDecision) -> None:
+    service, _ = _service(_StubResponse(_draft(status="no_risk")))
+    assert service.recommend(decision).generated_by == "rules"
+
+
+@pytest.mark.parametrize(
+    ("response", "error"),
+    [
+        (_StubResponse(None), AgentEmptyResponseError),
+        (_StubResponse(None, refusal=True), AgentRefusalError),
+        (_StubResponse(None, status="failed"), AgentProviderError),
+    ],
+)
+def test_service_draft_raises_and_recommend_falls_back(
+    decision: BillDecision, response: _StubResponse, error: type[Exception]
+) -> None:
+    service, _ = _service(response)
+
+    with pytest.raises(error):
+        service.draft(decision)
+    assert service.recommend(decision).generated_by == "rules"
+
+
+def test_service_translates_provider_errors(decision: BillDecision) -> None:
     from openai import APIConnectionError
 
-    client = _StubClient(APIConnectionError(request=None))  # type: ignore[arg-type]
-    service = AIAgentService(api_key="test-key", client=client)  # type: ignore[arg-type]
+    service, _ = _service(APIConnectionError(request=None))  # type: ignore[arg-type]
 
     with pytest.raises(AgentProviderError):
-        service.run("Hello")
+        service.draft(decision)
+    result = service.recommend(decision)
+    assert result.generated_by == "rules"
+    assert "sk-" not in (result.fallback_reason or "")
+
+
+def test_service_requires_api_key_for_draft(decision: BillDecision) -> None:
+    with pytest.raises(AgentConfigurationError):
+        AIAgentService(api_key=None).draft(decision)
